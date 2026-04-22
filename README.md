@@ -1,420 +1,157 @@
-# GRPO Post-Training with PPO and DPO Baselines
+# GRPO Training with MiniTorch CUDA Kernels
 
-This repository is organized around one main goal:
+GRPO (Group Relative Policy Optimization) training pipeline for GSM8K math reasoning, with custom fused CUDA kernels implemented via MiniTorch.
 
-- implement GRPO for post-training a language model
-- train a comparable PPO baseline
-- train a comparable DPO baseline
-- evaluate all three methods on the same prompts so GRPO can be compared against PPO and DPO
+**Base model:** `Qwen/Qwen3.5-2B`
 
-The paper runs in this repo currently use Hugging Face `gpt2` as the base policy. GPT-2 itself is not reimplemented here. The work in this repo is the post-training harnessing:
+## Project Structure
 
-- GRPO is implemented as a new trainer in `src/grpo_trainer.py`
-- PPO uses the existing trainer logic in `src/rlhf_trainer.py`, exposed through an explicit PPO harness
-- DPO is implemented as a new trainer in `src/dpo_trainer.py`
+```
+src/
+  grpo_trainer.py      # GRPO trainer with mini-batch grad accum and minitorch toggle
+  rlhf_trainer.py      # VERLPolicyWrapper (shared by PPO and GRPO)
+  gsm8k_reward.py      # Rule-based reward: extract #### answer, compare to ground truth
+  config.py            # All configuration dataclasses
+  dpo_trainer.py       # DPO baseline trainer
+  reward_model.py      # Neural reward model (for PPO)
+  policy_io.py         # Pluggable model load/save hooks
 
-PPO and GRPO optimize against the learned reward model. DPO trains directly on preference pairs and uses the reward model only for evaluation and model selection.
+minitorch/
+  ops.py               # 3 fused ops with CUDA kernel + PyTorch fallback
+  cuda_kernels/
+    grpo_kernels.cu    # CUDA kernel implementations
+    Makefile           # Compile with: make
 
-## MiniTorch Integration
+baselines/
+  run_trl.py           # HuggingFace TRL GRPOTrainer wrapper
+  run_verl.py          # VeRL integration (stub)
+  run_simple_grpo.py   # simple_GRPO baseline wrapper (stub)
 
-The training and evaluation harnesses are now integrated at the model I/O boundary so a MiniTorch-backed causal LM can be plugged in without changing the PPO, GRPO, or DPO learning logic.
-
-The integration points are:
-
-- `config.model.policy_loader`
-- `config.model.policy_saver`
-
-or the equivalent CLI flags on the main harness scripts:
-
-- `--model_loader module:function`
-- `--model_saver module:function`
-
-The expected contract is:
-
-- loader: return `(policy_model, tokenizer)` for a model identifier or checkpoint path
-- saver: persist `(policy_model, tokenizer)` to a checkpoint directory
-
-If these hooks are not set, the repo falls back to Hugging Face loading and `save_pretrained`.
-
-This means:
-
-- the core GRPO trainer already works with a ready model and tokenizer
-- the DPO trainer already works with a ready model and tokenizer
-- the PPO harness now also goes through the same external loader path instead of hard-coding Hugging Face model creation
-- the evaluator can load base and candidate models through the same external loader path
-
-The current catalyst experiment results were produced with the default Hugging Face GPT-2 path, not with a MiniTorch GPT-2 implementation. The harness is now prepared for MiniTorch integration, but this repository still does not contain a MiniTorch GPT-2 model implementation by itself.
-
-## What To Run
-
-Primary training scripts:
-
-- `scripts/run_grpo.py`
-- `scripts/run_ppo.py`
-- `scripts/run_dpo.py`
-
-Primary evaluation script:
-
-- `scripts/evaluate.py`
-
-Legacy compatibility entrypoints still exist, but they are not the primary interface:
-
-- `scripts/run_rlhf.py`
-- `slurm/run_rlhf.sh`
-- `create_rlhf_trainer(...)`
-
-Treat those as PPO aliases only.
-
-## Method Summary
-
-### GRPO
-
-GRPO is the main method under study. The trainer:
-
-- samples a group of completions per prompt
-- scores those completions with the reward model
-- normalizes rewards within each prompt group
-- applies a clipped policy objective on generated tokens only
-- keeps a frozen reference policy for optional KL regularization
-
-Core API:
-
-```python
-create_grpo_trainer(policy_model, tokenizer, reward_model, config, device)
+scripts/
+  run_grpo_gsm8k.py    # Main GRPO training entrypoint
+  evaluate_grpo.py     # Greedy evaluation on val/test splits
+  benchmark_all.py     # Unified comparison harness across all methods
 ```
 
-Main output root:
+## MiniTorch CUDA Kernels
 
-- `outputs/grpo_model`
+Three fused CUDA kernels replace multi-step PyTorch operations in the GRPO training loop:
 
-### PPO
+| Kernel | What it fuses | Where used |
+|--------|--------------|------------|
+| `fused_log_prob_gather` | gather + logsumexp over 151k vocab in one pass | Log prob computation in `train_step` |
+| `group_advantage_norm` | mean + std + normalize per group via shared memory | `_compute_group_advantages()` |
+| `fused_grpo_objective` | clipped surrogate + KL divergence in one grid-stride loop | `_compute_policy_objective()` |
 
-PPO is the reward-model baseline. The harness reuses the existing policy/value implementation and exposes it as a first-class comparison script.
+Each op has a **PyTorch fallback** that runs when the compiled `.so` is unavailable, so everything works without CUDA compilation.
 
-Core API:
-
-```python
-create_ppo_trainer(model_name, reward_model, config, device)
-```
-
-Main output root:
-
-- `outputs/ppo_model`
-
-### DPO
-
-DPO is the preference-pair baseline. It does not optimize the reward model directly. Instead, it:
-
-- trains on `prompt`, `chosen`, `rejected` triples
-- keeps a frozen reference policy
-- computes DPO loss on completion tokens only
-- uses reward-model evaluation to choose the best checkpoint for comparison parity with PPO and GRPO
-
-Core API:
-
-```python
-create_dpo_trainer(policy_model, tokenizer, config, device)
-```
-
-Main output root:
-
-- `outputs/dpo_model`
-
-## Recommended Experiment Flow
-
-The intended comparison is:
-
-1. Train the reward model.
-2. Post-train GPT-2 with GRPO.
-3. Post-train GPT-2 with PPO.
-4. Post-train GPT-2 with DPO.
-5. Evaluate each resulting model on the same held-out prompts.
-6. Compare GRPO against PPO and DPO using the saved evaluation summaries and reward plots.
-
-### 1. Prepare data
+### Compile kernels (on cluster)
 
 ```bash
-python3 scripts/prepare_data.py \
-  --dataset Anthropic/hh-rlhf \
-  --output_dir data \
-  --max_samples 10000
+cd minitorch/cuda_kernels
+make
 ```
 
-This produces the prompt and preference data used by the downstream scripts.
-
-### 2. Train the reward model
+### Toggle minitorch
 
 ```bash
-python3 scripts/train_reward_model.py
+# PyTorch-only (default)
+python scripts/run_grpo_gsm8k.py --model_name Qwen/Qwen3.5-2B
+
+# With minitorch CUDA kernels
+python scripts/run_grpo_gsm8k.py --model_name Qwen/Qwen3.5-2B --use_minitorch
 ```
 
-This creates the reward model used by:
+## Quick Start
 
-- PPO training
-- GRPO training
-- reward-based evaluation for PPO, GRPO, and DPO
-
-### 3. Train GRPO
-
-This is the primary method.
-
-Smoke run:
+### 1. Prepare GSM8K data
 
 ```bash
-python3 scripts/run_grpo.py \
-  --model_name gpt2 \
-  --num_epochs 1 \
-  --batch_size 2 \
-  --group_size 2 \
-  --update_epochs 1 \
-  --rollout_max_length 64 \
-  --max_train_prompts 16 \
-  --max_eval_prompts 4
+python scripts/prepare_gsm8k.py
 ```
 
-Saved model directories:
-
-- `outputs/grpo_model/best_grpo_model`
-- `outputs/grpo_model/final_grpo_model`
-
-### 4. Train PPO
-
-This is the closest reward-model baseline to GRPO.
-
-Smoke run:
+### 2. Train GRPO on GSM8K
 
 ```bash
-python3 scripts/run_ppo.py \
-  --model_name gpt2 \
-  --num_epochs 1 \
-  --batch_size 2 \
-  --max_train_prompts 16 \
-  --max_eval_prompts 4 \
-  --rollout_max_length 64 \
-  --ppo_update_epochs 1
+python scripts/run_grpo_gsm8k.py \
+    --model_name Qwen/Qwen3.5-2B \
+    --num_epochs 2 \
+    --batch_size 2 \
+    --group_size 16 \
+    --learning_rate 1e-6 \
+    --kl_penalty 0.04 \
+    --rollout_max_length 512 \
+    --use_minitorch
 ```
 
-Saved model directories:
-
-- `outputs/ppo_model/best_ppo_model`
-- `outputs/ppo_model/final_ppo_model`
-
-### 5. Train DPO
-
-This is the preference-learning baseline.
-
-Smoke run:
+### 3. Evaluate checkpoint
 
 ```bash
-python3 scripts/run_dpo.py \
-  --model_name gpt2 \
-  --num_epochs 1 \
-  --batch_size 2 \
-  --max_train_pairs 16 \
-  --max_val_pairs 4 \
-  --max_test_pairs 4 \
-  --max_eval_prompts 4
+python scripts/evaluate_grpo.py \
+    --checkpoint results/<run_dir>/checkpoints/best_model \
+    --val_data data/gsm8k_val.json \
+    --test_data data/gsm8k_test.json
 ```
 
-Saved model directories:
-
-- `outputs/dpo_model/best_dpo_model`
-- `outputs/dpo_model/final_dpo_model`
-
-If `data/preference_data_val.json` and `data/preference_data_test.json` do not exist, the DPO harness deterministically splits `data/preference_data.json` using the configured split ratios.
-
-## How To Compare GRPO Against PPO and DPO
-
-The evaluator compares the base model against one candidate method at a time. That means the comparison workflow is:
-
-1. evaluate GRPO against base GPT-2
-2. evaluate PPO against base GPT-2
-3. evaluate DPO against base GPT-2
-4. compare the resulting summaries side by side
-
-There is no separate direct `grpo vs ppo` evaluator. Instead, all methods are measured against the same base model and prompt set, which gives a clean comparison axis.
-
-### Evaluate GRPO
+### 4. Benchmark all methods
 
 ```bash
-python3 scripts/evaluate.py \
-  --base_model gpt2 \
-  --candidate_model outputs/grpo_model \
-  --candidate_label grpo
+python scripts/benchmark_all.py \
+    --model_name Qwen/Qwen3.5-2B \
+    --methods ours ours_minitorch trl simple_grpo
 ```
 
-### Evaluate PPO
+## Baseline Comparisons
+
+Five variants for comparison:
+
+| Method | Script | Description |
+|--------|--------|-------------|
+| **Ours (PyTorch)** | `scripts/run_grpo_gsm8k.py` | Our GRPO implementation, PyTorch ops |
+| **Ours (MiniTorch)** | `scripts/run_grpo_gsm8k.py --use_minitorch` | Same implementation, fused CUDA kernels |
+| **TRL** | `baselines/run_trl.py` | HuggingFace TRL GRPOTrainer |
+| **VeRL** | `baselines/run_verl.py` | VeRL framework (stub) |
+| **Simple_GRPO** | `baselines/run_simple_grpo.py` | [simple_GRPO](https://github.com/lsdefine/simple_GRPO) (stub) |
+
+## Memory Optimizations
+
+- **Log prob computation:** `gather + logsumexp` instead of full `log_softmax` over 151k vocab (~18GB VRAM savings)
+- **Mini-batched forward passes:** Splits sequences into chunks for forward/backward to control peak memory
+- **Mini-batch gradient accumulation:** Configurable `mini_batch_size` in `train_step`
+
+## PPO and DPO Baselines
+
+The repo also includes PPO and DPO trainers from prior work:
+
+- `scripts/run_ppo.py` — PPO with learned reward model
+- `scripts/run_dpo.py` — DPO with preference pairs
+- `scripts/evaluate.py` — General evaluation script
+
+These use GPT-2 as the base model and are independent of the GSM8K GRPO pipeline.
+
+## Bridges-2 Cluster
 
 ```bash
-python3 scripts/evaluate.py \
-  --base_model gpt2 \
-  --candidate_model outputs/ppo_model \
-  --candidate_label ppo
-```
-
-### Evaluate DPO
-
-```bash
-python3 scripts/evaluate.py \
-  --base_model gpt2 \
-  --candidate_model outputs/dpo_model \
-  --candidate_label dpo
-```
-
-### What To Compare
-
-For the final GRPO vs PPO vs DPO comparison, look at:
-
-- `evaluation_results/evaluation_summary_grpo.json`
-- `evaluation_results/evaluation_summary_ppo.json`
-- `evaluation_results/evaluation_summary_dpo.json`
-
-and the method-specific plots:
-
-- `plots/reward_comparison_grpo.png`
-- `plots/reward_comparison_ppo.png`
-- `plots/reward_comparison_dpo.png`
-
-and the training summaries:
-
-- `logs/grpo_training_summary.json`
-- `logs/ppo_training_summary.json`
-- `logs/dpo_training_summary.json`
-
-In practice, the most important comparison is:
-
-- reward statistics on the held-out evaluation prompts
-- sample outputs saved by each harness
-- whether GRPO outperforms PPO and DPO under the same evaluation setup
-
-## Output Layout
-
-### GRPO artifacts
-
-- model root: `outputs/grpo_model`
-- checkpoints:
-  - `best_grpo_model`
-  - `final_grpo_model`
-  - `grpo_checkpoint_epoch_{n}.pt`
-- metrics:
-  - `logs/grpo_training_metrics.json`
-  - `logs/grpo_training_summary.json`
-- plots:
-  - `plots/grpo_training_curves.png`
-  - `plots/grpo_reward_distribution.png`
-- sample outputs:
-  - `logs/baseline_outputs_grpo.json`
-  - `logs/grpo_outputs.json`
-  - `logs/grpo_model_comparison.json`
-
-### PPO artifacts
-
-- model root: `outputs/ppo_model`
-- checkpoints:
-  - `best_ppo_model`
-  - `final_ppo_model`
-  - `ppo_checkpoint_epoch_{n}.pt`
-- metrics:
-  - `logs/ppo_training_metrics.json`
-  - `logs/ppo_training_summary.json`
-- plots:
-  - `plots/ppo_training_curves.png`
-  - `plots/ppo_reward_distribution.png`
-- sample outputs:
-  - `logs/baseline_outputs_ppo.json`
-  - `logs/ppo_outputs.json`
-  - `logs/ppo_model_comparison.json`
-
-### DPO artifacts
-
-- model root: `outputs/dpo_model`
-- checkpoints:
-  - `best_dpo_model`
-  - `final_dpo_model`
-  - `dpo_checkpoint_epoch_{n}.pt`
-- metrics:
-  - `logs/dpo_training_metrics.json`
-  - `logs/dpo_training_summary.json`
-- plots:
-  - `plots/dpo_training_curves.png`
-  - `plots/dpo_reward_distribution.png`
-- sample outputs:
-  - `logs/baseline_outputs_dpo.json`
-  - `logs/dpo_outputs.json`
-  - `logs/dpo_model_comparison.json`
-
-## Bridges-2 Usage
-
-Use `/ocean` for Hugging Face cache directories so the home directory does not fill up:
-
-```bash
-mkdir -p /ocean/projects/cis260009p/atewari1/huggingface
-mkdir -p /ocean/projects/cis260009p/atewari1/huggingface_cache
 export HF_HOME=/ocean/projects/cis260009p/atewari1/huggingface
 export HF_HUB_CACHE=/ocean/projects/cis260009p/atewari1/huggingface_cache
 ```
 
-Available Slurm launchers:
-
-- `slurm/train_reward_model.sh`
-- `slurm/run_grpo.sh`
-- `slurm/run_ppo.sh`
-- `slurm/run_dpo.sh`
-- `slurm/evaluate.sh`
-
-Submit jobs with:
+Slurm scripts in `slurm/`:
 
 ```bash
-sbatch slurm/train_reward_model.sh
-sbatch slurm/run_grpo.sh
-sbatch slurm/run_ppo.sh
-sbatch slurm/run_dpo.sh
-sbatch slurm/evaluate.sh
+sbatch slurm/run_grpo.sh          # GRPO training
+sbatch slurm/run_eval_grpo.sh     # GRPO evaluation
+sbatch slurm/run_ppo.sh           # PPO baseline
+sbatch slurm/run_dpo.sh           # DPO baseline
 ```
-
-The intended cluster workflow is the same as local execution:
-
-1. train reward model
-2. run GRPO
-3. run PPO
-4. run DPO
-5. run evaluation for each method
-6. compare GRPO against PPO and DPO from the saved summaries
 
 ## Tests
 
-Relevant regression coverage:
-
-- `tests/test_grpo_trainer.py`
-- `tests/test_ppo_harness.py`
-- `tests/test_rlhf_eos_pad.py`
-- `tests/test_dpo_trainer.py`
-- `tests/test_dpo_harness.py`
-- `tests/test_run_dpo_smoke.py`
-- `tests/test_evaluate_candidate.py`
-
-Run all tests with:
-
 ```bash
-python3 -m pytest tests -q
+python -m pytest tests/test_gsm8k_reward.py minitorch/tests/test_ops.py -v
 ```
 
-## Short Summary
-
-If you only need the essential workflow:
-
-1. `python3 scripts/train_reward_model.py`
-2. `python3 scripts/run_grpo.py ...`
-3. `python3 scripts/run_ppo.py ...`
-4. `python3 scripts/run_dpo.py ...`
-5. `python3 scripts/evaluate.py --candidate_model outputs/grpo_model --candidate_label grpo`
-6. `python3 scripts/evaluate.py --candidate_model outputs/ppo_model --candidate_label ppo`
-7. `python3 scripts/evaluate.py --candidate_model outputs/dpo_model --candidate_label dpo`
-
-Then compare:
-
-- `evaluation_results/evaluation_summary_grpo.json`
-- `evaluation_results/evaluation_summary_ppo.json`
-- `evaluation_results/evaluation_summary_dpo.json`
-
-That is the comparison path for measuring whether the GRPO implementation improves over PPO and DPO on the same base GPT-2 model and evaluation setup.
+- `tests/test_gsm8k_reward.py` — Reward function: answer extraction, normalization, scoring
+- `minitorch/tests/test_ops.py` — MiniTorch ops: each kernel output vs PyTorch reference
+- `tests/test_grpo_trainer.py` — GRPO trainer unit tests
+- `tests/test_rlhf_eos_pad.py` — EOS/pad masking for GPT-2 and Qwen3 paths

@@ -213,10 +213,4 @@ logs/
 plots/
 evaluation_results/
 results/
-checkpoints/
-third_party/
-
-# Secrets / API keys
 wandb_api_key.json
-*.secret
-*.credentials
